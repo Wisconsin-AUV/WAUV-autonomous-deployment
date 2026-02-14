@@ -1,1 +1,31 @@
 # WauvSoftware
+
+please add these to your .gitignore: 
+
+
+# ROS2 build directories
+build/*
+install/*
+log/*
+
+# Python cache
+_pycache_/*
+*.pyc
+*.pyo
+*.pyd
+
+# Colcon
+.colcon/*
+
+# Editor / IDE
+.vscode/*
+.idea/*
+*.swp
+*~
+
+# Python venvs
+*env*/*
+.env/*
+
+# ROS2 launch logs
+*.launch.pyc
