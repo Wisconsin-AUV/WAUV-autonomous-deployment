@@ -4,9 +4,6 @@ import matplotlib.pyplot as plt
 # from google.colab import files
 import numpy as np
 
-#upload image into a variable called uploaded
-# uploaded
-
 # Read the uploaded image
 # image_path = next(iter(uploaded))
 # image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -18,12 +15,10 @@ image = cv2.imread("./media/gate_task.png")
 
 hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-#white detection
+# white detection
 lower_white = np.array([0, 0, 180])
 upper_white = np.array([180, 30, 225])
 white_mask = cv2.inRange(hsv, lower_white, upper_white)
-
-#
 
 # simple white balance
 def correct_underwater(image):
@@ -61,6 +56,6 @@ plt.axis('off')
 
 plt.subplot(1, 3, 3)
 plt.title('Edge Detected Image')
-plt.imshow(result, cmap='gray')
+plt.imshow(edges, cmap='gray')
 plt.axis('off')
 plt.show()
