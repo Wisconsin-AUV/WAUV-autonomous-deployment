@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 class SubDynamics:
     def __init__(self, dt=0.1, device='cpu'):
@@ -14,7 +15,7 @@ class SubDynamics:
         # Mass Matrix
         # Format:[Mass_X, Mass_Y, Mass_Z, Inertia_Roll, Inertia_Pitch, Inertia_Yaw]
         self.M = None 
-        self.M_inv = None  
+        self.M_inv = 1/self.M  
 
         # Drag Coefficients (Linear and Quadratic)
         # Format:[X, Y, Z, K, M, N]
@@ -40,22 +41,61 @@ class SubDynamics:
         u, v, w = nu[:, 0], nu[:, 1], nu[:, 2]
         p, q, r = nu[:, 3], nu[:, 4], nu[:, 5]
 
-        # TODO Restoring Forces (Gravity & Buoyancy)
+        # Maps the 4-DOF input action[u, v, w, yaw] into 6-DOF body forces/torques
+        batch_size = state.shape[0]
+        tau = torch.zeros((batch_size, 6), device=self.device)
+        tau[:, 0] = action[:, 0]  # Surge force
+        tau[:, 1] = action[:, 1]  # Sway force
+        tau[:, 2] = action[:, 2]  # Heave force
+        tau[:, 5] = action[:, 3]  # Yaw torque
+        # Roll (K) and Pitch (M) torques are assumed 0 since they aren't actuated
+
+        #   Restoring Forces (Gravity & Buoyancy)
         # 6 equations mapping W and B into the body frame.
-        g_eta = None
+        g_eta = torch.stack([
+            (self.W - self.B) * torch.sin(theta),
+            -(self.W - self.B) * torch.cos(theta) * torch.sin(phi),
+            -(self.W - self.B) * torch.cos(theta) * torch.cos(phi),
+            -self.z_b * self.B * torch.cos(theta) * torch.sin(phi),
+            -self.z_b * self.B * torch.sin(theta),
+            torch.zeros_like(theta)
+        ], dim=1)
 
-        # TODO Hydrodynamic Drag
-        #  Calculate linear drag: D_lin * nu
-        # Calculate quadratic drag: D_quad * abs(nu) * nu
-        drag = None
+        # Hydrodynamic Drag
+        #  Calculate linear drag
+        lin_drag = self.D_lin * nu
+        # Calculate quadratic drag:
+        quad_drag = self.D_quad * torch.abs(nu) * nu
+        drag = lin_drag + quad_drag
         
-        # TODO Acceleration (Fossen's Equation)
-        # Calculate net force: tau - drag - g_eta
-        # Multiply by M_inv to get body acceleration: dot_nu
-        dot_nu = None
+        # Acceleration (Fossen's Equation)
+        net_force = tau - drag - g_eta
+        dot_nu = self.M_inv*(net_force)
 
-        #TODO Update Body Velocity
-        nu_next = None
+        #Update Body Velocity
+        nu_next = nu + dot_nu * self.dt
         
+        #convert body frame to global frame
+        c_phi, s_phi = torch.cos(phi), torch.sin(phi)
+        c_theta, s_theta = torch.cos(theta), torch.sin(theta)
+        c_psi, s_psi = torch.cos(psi), torch.sin(psi)
+
+        dot_eta = torch.zeros_like(eta)
+
+        # Linear velocities
+        dot_eta[:, 0] = u*(c_psi*c_theta) + v*(c_psi*s_theta*s_phi - s_psi*c_phi) + w*(c_psi*s_theta*c_phi + s_psi*s_phi)
+        dot_eta[:, 1] = u*(s_psi*c_theta) + v*(s_psi*s_theta*s_phi + c_psi*c_phi) + w*(s_psi*s_theta*c_phi - c_psi*s_phi)
+        dot_eta[:, 2] = -u*s_theta + v*(c_theta*s_phi) + w*(c_theta*c_phi)
+        
+        # Angular velocities
+        dot_eta[:, 3] = p + q*(s_phi*s_theta/c_theta_safe) + r*(c_phi*s_theta/c_theta_safe)
+        dot_eta[:, 4] = q*c_phi - r*s_phi
+        dot_eta[:, 5] = q*(s_phi/c_theta_safe) + r*(c_phi/c_theta_safe)
+
+        # Global position update
+        eta_next = eta + dot_eta * self.dt
+
+        # Combine updated eta and nu into next_state
+        next_state = torch.cat([eta_next, nu_next], dim=1)
 
         return next_state
