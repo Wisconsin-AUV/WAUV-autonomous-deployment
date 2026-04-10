@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import matplotlib.pyplot as plt
 # from google.colab import files
@@ -22,7 +23,8 @@ def show_image(img, **kwargs):
 
 # image = cv2.imread("./media/gate_task.png", cv2.IMREAD_GRAYSCALE)
 script_dir = os.path.dirname(os.path.abspath(__file__))
-image_path = os.path.join(script_dir, "media", "gate_task.png")
+image_name = sys.argv[1] if len(sys.argv) > 1 else "gate_task.png"
+image_path = os.path.join(script_dir, "media", image_name)
 image = cv2.imread(image_path)
 
 if image is None:
