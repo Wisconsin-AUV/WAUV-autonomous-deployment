@@ -1,210 +1,320 @@
+"""
+edge_detect.py — vertical edge-pair pole detector
+--------------------------------------------------
+Detects slalom poles and gate posts in underwater AUV imagery.
+
+Usage:
+    python edge_detect.py image_cross.png
+    python edge_detect.py "image (2).png"
+    python edge_detect.py gate_task.png
+
+How it works:
+  Each thin PVC pole creates TWO parallel vertical edges — a brightening
+  boundary on its left side and a darkening boundary on its right side,
+  roughly 3-10 pixels apart. This detector:
+
+    1. Extracts positive and negative Sobel-X edges separately
+    2. Enforces tall vertical continuity (80-px morphological open) so
+       scattered noise is eliminated while real pole edges survive
+    3. Looks for matching left+right edge columns within the expected
+       pole-width range (3-10 px apart) that both persist strongly
+       in the LOWER portion of the frame (where the poles are anchored)
+    4. Merges overlapping column-pairs, filters by position and size,
+       and draws the final pole mask
+
+Gate mode uses the same core but keeps only the leftmost and rightmost
+detected poles (= the two outer gate frame posts).
+"""
+
 import os
 import sys
 import cv2
-import matplotlib.pyplot as plt
-# from google.colab import files
 import numpy as np
+import matplotlib.pyplot as plt
 
-def show_image(img, **kwargs):
+
+# ---------------------------------------------------------------------------
+# Core detector
+# ---------------------------------------------------------------------------
+
+def find_poles(image,
+               sobel_thresh=20,
+               continuity_px=80,
+               min_lower_rows=80,
+               min_pole_width=3,
+               max_pole_width=11,
+               lower_frac=0.30,
+               border_frac=0.03):
     """
-    Display an image with Matplotlib, converting BGR to RGB if needed.
-    If the image has 3 channels, assume BGR and convert to RGB.
-    If the image has 1 channel, display as grayscale.
+    Detect poles via vertical edge pairing.
+
+    Parameters
+    ----------
+    sobel_thresh      : Sobel-X magnitude threshold (0-255 after normalise)
+    continuity_px     : morphological-open height — edge must span this many
+                        rows without a gap to survive
+    min_lower_rows    : minimum number of rows (in the lower `1-lower_frac`
+                        portion of the image) where the edge must be active
+    min/max_pole_width: expected pole width in pixels
+    lower_frac        : ignore the top `lower_frac` fraction for row-counting
+    border_frac       : ignore detected poles whose x-centre is within this
+                        fraction of the image edge (lens border / frame)
+
+    Returns
+    -------
+    intermediates : dict of labelled diagnostic images
+    pole_spans    : list of (xl, xr, y_top, y_bot) for each detected pole
+    pole_mask     : uint8 binary mask, 255 on detected poles
     """
-    if len(img.shape) == 3 and img.shape[2] == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        plt.imshow(img, **kwargs)
+    h, w = image.shape[:2]
+    lower_start = int(h * lower_frac)
+    border_px   = int(w * border_frac)
+
+    # ------------------------------------------------------------------
+    # 1. CLAHE on grayscale → slight blur to reduce 1-pixel noise
+    # ------------------------------------------------------------------
+    gray     = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    blurred  = cv2.GaussianBlur(enhanced, (3, 3), 0.8)
+
+    # ------------------------------------------------------------------
+    # 2. Sobel-X: detect horizontal brightness transitions
+    #    Positive = left edge of pole (dark-to-bright going right)
+    #    Negative = right edge of pole (bright-to-dark going right)
+    # ------------------------------------------------------------------
+    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+
+    def to_binary(arr, t):
+        mx = arr.max()
+        if mx < 1e-6:
+            return np.zeros(arr.shape, dtype=np.uint8)
+        normed = (arr / mx * 255).astype(np.uint8)
+        _, binary = cv2.threshold(normed, t, 255, cv2.THRESH_BINARY)
+        return binary
+
+    left_bin  = to_binary(np.clip( sobelx, 0, None), sobel_thresh)
+    right_bin = to_binary(np.clip(-sobelx, 0, None), sobel_thresh)
+
+    # ------------------------------------------------------------------
+    # 3. Enforce vertical continuity
+    #    Close small gaps first (small kernel), then open with a tall
+    #    narrow kernel to require a minimum unbroken vertical run.
+    # ------------------------------------------------------------------
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 10))
+    open_k  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, continuity_px))
+
+    def enforce(b):
+        closed = cv2.morphologyEx(b, cv2.MORPH_CLOSE, close_k, iterations=2)
+        return  cv2.morphologyEx(closed, cv2.MORPH_OPEN,  open_k,  iterations=1)
+
+    left_cont  = enforce(left_bin)
+    right_cont = enforce(right_bin)
+
+    # ------------------------------------------------------------------
+    # 4. Column-wise row counts in the LOWER portion of the frame
+    #    (where poles are anchored — ignores water-surface ripple noise)
+    # ------------------------------------------------------------------
+    left_lower  = (left_cont [lower_start:, :] > 0).sum(axis=0)
+    right_lower = (right_cont[lower_start:, :] > 0).sum(axis=0)
+
+    # ------------------------------------------------------------------
+    # 5. Pair left-edge columns with right-edge columns
+    #    Both sides must meet the min_lower_rows threshold.
+    #    Take the closest right-edge match within the width range.
+    # ------------------------------------------------------------------
+    active_left = np.where(left_lower >= min_lower_rows)[0]
+    right_set   = set(np.where(right_lower >= min_lower_rows)[0].tolist())
+
+    raw_pairs = []   # (xl, xr, left_count, right_count)
+    for xl in active_left:
+        if xl < border_px or xl > w - border_px:
+            continue
+        for d in range(min_pole_width, max_pole_width + 1):
+            xr = xl + d
+            if xr in right_set and right_lower[xr] >= min_lower_rows:
+                raw_pairs.append((xl, xr,
+                                  int(left_lower[xl]),
+                                  int(right_lower[xr])))
+                break
+
+    # ------------------------------------------------------------------
+    # 6. Merge overlapping / adjacent column pairs into single pole spans
+    # ------------------------------------------------------------------
+    raw_pairs.sort()
+    merged = []
+    if raw_pairs:
+        xl0, xr0, ll0, rl0 = raw_pairs[0]
+        for xl, xr, ll, rl in raw_pairs[1:]:
+            if xl <= xr0 + 5:               # overlap / adjacent — expand
+                xr0 = max(xr0, xr)
+                ll0 = max(ll0, ll)
+                rl0 = max(rl0, rl)
+            else:
+                merged.append((xl0, xr0, ll0, rl0))
+                xl0, xr0, ll0, rl0 = xl, xr, ll, rl
+        merged.append((xl0, xr0, ll0, rl0))
+
+    # ------------------------------------------------------------------
+    # 7. Find vertical extent for each merged span and build the mask
+    # ------------------------------------------------------------------
+    pole_spans = []
+    pole_mask  = np.zeros((h, w), dtype=np.uint8)
+
+    for xl, xr, ll, rl in merged:
+        cx = (xl + xr) // 2
+
+        # Skip anything too close to the image border
+        if cx < border_px or cx > w - border_px:
+            continue
+
+        # Get rows where either edge is active (whole-image, not just lower)
+        rows_l = np.where(left_cont [:, xl] > 0)[0]
+        rows_r = np.where(right_cont[:, xr] > 0)[0]
+        all_rows = np.concatenate([rows_l, rows_r])
+        if len(all_rows) == 0:
+            continue
+
+        y_top = int(all_rows.min())
+        y_bot = int(all_rows.max())
+        span  = y_bot - y_top
+
+        # Must span at least 20 % of image height
+        if span < h * 0.20:
+            continue
+
+        # Must NOT start at the very top of the frame
+        # (frame edges / water-surface artifacts always originate at y≈0)
+        if y_top < h * 0.05:
+            continue
+
+        pole_spans.append((xl, xr, y_top, y_bot))
+        cv2.rectangle(pole_mask,
+                      (xl, y_top),
+                      (xr, y_bot),
+                      255, -1)
+
+    intermediates = {
+        "enhanced":      enhanced,
+        "left_cont":     left_cont,
+        "right_cont":    right_cont,
+        "edge_combined": cv2.add(left_cont, right_cont),
+    }
+    return intermediates, pole_spans, pole_mask
+
+
+# ---------------------------------------------------------------------------
+# Gate mode: run detector then keep only leftmost + rightmost poles
+# ---------------------------------------------------------------------------
+
+def detect_gate_poles(image):
+    inter, spans, full_mask = find_poles(
+        image,
+        sobel_thresh=15,
+        continuity_px=60,
+        min_lower_rows=60,
+        min_pole_width=3,
+        max_pole_width=14,
+        lower_frac=0.25,
+        border_frac=0.12,          # gate image has a large fisheye border
+    )
+    h, w = image.shape[:2]
+
+    if len(spans) < 2:
+        print(f"  [gate] Only {len(spans)} pole(s) — using all")
+        return inter, spans, full_mask
+
+    spans_sorted = sorted(spans, key=lambda s: (s[0] + s[1]) // 2)
+    selected = [spans_sorted[0], spans_sorted[-1]]
+
+    gate_mask = np.zeros((h, w), dtype=np.uint8)
+    for xl, xr, yt, yb in selected:
+        cx   = (xl + xr) // 2
+        side = "LEFT" if cx < w // 2 else "RIGHT"
+        print(f"  [gate] {side} pole: cx={cx}, y={yt}→{yb}")
+        cv2.rectangle(gate_mask, (xl, yt), (xr, yb), 255, -1)
+
+    return inter, selected, gate_mask
+
+
+# ---------------------------------------------------------------------------
+# Overlay builder
+# ---------------------------------------------------------------------------
+
+def build_overlay(image, pole_spans):
+    """Green tint on pole regions + red bounding box around each pole."""
+    overlay = image.copy()
+
+    for xl, xr, yt, yb in pole_spans:
+        overlay[yt:yb+1, xl:xr+1] = [0, 255, 0]
+
+    blended = cv2.addWeighted(image, 0.5, overlay, 0.5, 0)
+
+    for xl, xr, yt, yb in pole_spans:
+        cv2.rectangle(blended, (xl, yt), (xr, yb), (0, 0, 255), 2)
+
+    return blended
+
+
+# ---------------------------------------------------------------------------
+# Display helper
+# ---------------------------------------------------------------------------
+
+def show_image(img, title, ax):
+    if len(img.shape) == 3:
+        ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     else:
-        plt.imshow(img, cmap='gray', **kwargs)
+        ax.imshow(img, cmap="gray")
+    ax.set_title(title, fontsize=9)
+    ax.axis("off")
 
-# Read the uploaded image
-# image_path = next(iter(uploaded))
-# image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 
-# image = cv2.imread("./media/gate_task.png", cv2.IMREAD_GRAYSCALE)
-script_dir = os.path.dirname(os.path.abspath(__file__))
-image_name = sys.argv[1] if len(sys.argv) > 1 else "gate_task.png"
-image_path = os.path.join(script_dir, "media", image_name)
-image = cv2.imread(image_path)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-if image is None:
-    raise FileNotFoundError(f"Image not found at '{image_path}'. Check the file path and try again.")
+def run(image_name):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    image_path = os.path.join(script_dir, "media", image_name)
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Not found: '{image_path}'")
 
-# simple white balance
-def correct_underwater(image):
-    b, g, r = cv2.split(image)
-    r = cv2.equalizeHist(r)
-    b = cv2.equalizeHist(b) # reduce the blue dominance
-    return cv2.merge([b, g, r])
+    h, w = image.shape[:2]
+    mode = "gate" if "gate" in image_name.lower() else "slalom"
+    print(f"=== {mode.upper()} | {image_name} ({w}×{h}) ===")
 
-correct = correct_underwater(image)
+    if mode == "gate":
+        inter, spans, _ = detect_gate_poles(image)
+    else:
+        inter, spans, _ = find_poles(image)
 
-# =====================================================
-# STEP 1: Convert to grayscale
-# =====================================================
-gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    print(f"  Poles found: {len(spans)}")
+    for i, (xl, xr, yt, yb) in enumerate(spans):
+        print(f"    pole {i+1}: cx={(xl+xr)//2}  x={xl}→{xr}  y={yt}→{yb}  h={yb-yt}px")
 
-# =====================================================
-# STEP 2: Apply CLAHE for local contrast enhancement
-# This makes the dark columns stand out more against
-# the blue water, even with uneven lighting.
-# =====================================================
-clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-enhanced = clahe.apply(gray)
+    result = build_overlay(image, spans)
 
-# =====================================================
-# STEP 3: Threshold to get black/white mask of dark regions
-# Low pixel values = dark columns
-# =====================================================
-_, dark_thresh = cv2.threshold(enhanced, 60, 255, cv2.THRESH_BINARY_INV)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"{image_name}  [{mode}]  — {len(spans)} poles detected",
+                 fontsize=13, fontweight="bold")
 
-# =====================================================
-# STEP 4: Vertical morphological filtering
-# Use a tall, narrow kernel to keep only vertical structures
-# and remove horizontal noise, crosses, etc.
-# =====================================================
-vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
-vertical_mask = cv2.morphologyEx(dark_thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+    show_image(image,                   "1. Original",                 axes[0, 0])
+    show_image(inter["enhanced"],       "2. CLAHE Grayscale",          axes[0, 1])
+    show_image(inter["left_cont"],      "3. Left edges (sustained)",   axes[0, 2])
+    show_image(inter["right_cont"],     "4. Right edges (sustained)",  axes[1, 0])
+    show_image(inter["edge_combined"],  "5. Both edges combined",      axes[1, 1])
+    show_image(result,                  f"6. Result — {len(spans)} poles", axes[1, 2])
 
-# Close small gaps in the vertical structures
-close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
-vertical_mask = cv2.morphologyEx(vertical_mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+    plt.tight_layout()
 
-# =====================================================
-# STEP 4b: Isolate only the slalom columns
-# - Focus on the lower half of the image
-# - Keep only structures near the left and right edges
-# =====================================================
-img_height, img_width = image.shape[:2]
+    base     = os.path.splitext(image_name)[0].replace(" ", "_")
+    out_path = os.path.join(script_dir, "media", f"{base}_poles.png")
+    cv2.imwrite(out_path, result)
+    print(f"  Saved → {out_path}")
+    plt.show()
 
-# Find contours in the vertical mask
-contours, _ = cv2.findContours(vertical_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-# Create a new mask with only the slalom columns
-slalom_mask = np.zeros_like(vertical_mask)
-print(f"\n=== Contour Debug Info ===")
-print(f"Image size: {img_width}x{img_height}")
-print(f"Lower region cutoff (40%): y > {img_height * 0.4:.0f}")
-print(f"Left edge cutoff (35%):  x < {img_width * 0.35:.0f}")
-print(f"Right edge cutoff (65%): x > {img_width * 0.65:.0f}")
-print(f"Total contours found: {len(contours)}\n")
-
-for i, c in enumerate(contours):
-    x, y, w, h = cv2.boundingRect(c)
-    center_x = x + w // 2
-    bottom_y = y + h
-
-    # Must START in the lower half (eliminates reflections in upper half)
-    starts_in_lower_half = y > img_height * 0.4
-
-    # Must be near the left or right edge of the image (not in the center)
-    in_left = center_x < img_width * 0.35
-    in_right = center_x > img_width * 0.65
-
-    # Must be tall enough to be a slalom pole
-    is_tall = h > 50
-
-    # Must be a reasonable width (not a huge edge blob, not a thin noise line)
-    reasonable_width = 5 < w < 60
-
-    kept = starts_in_lower_half and (in_left or in_right) and is_tall and reasonable_width
-    print(f"  Contour {i}: pos=({x},{y}) size=({w}x{h}) center_x={center_x} bottom_y={bottom_y} | starts_lower={starts_in_lower_half} left={in_left} right={in_right} tall={is_tall} width_ok={reasonable_width} → {'✅ KEPT' if kept else '❌ rejected'}")
-
-    if kept:
-        cv2.drawContours(slalom_mask, [c], -1, 255, -1)
-
-# Replace the vertical mask with just the slalom columns
-vertical_mask = slalom_mask
-
-# =====================================================
-# STEP 5: Canny edge detection on enhanced image
-# =====================================================
-blurred = cv2.GaussianBlur(enhanced, (5, 5), 1.4)
-edges = cv2.Canny(blurred, 30, 100)
-
-# Only keep edges within the vertical column mask
-column_edges = cv2.bitwise_and(edges, edges, mask=vertical_mask)
-
-# =====================================================
-# STEP 6: Hough Line Transform to detect vertical lines
-# This finds the straight slalom pole lines
-# =====================================================
-lines_image = image.copy()
-lines = cv2.HoughLinesP(
-    column_edges,
-    rho=1,
-    theta=np.pi / 180,
-    threshold=15,
-    minLineLength=25,
-    maxLineGap=30
-)
-
-# Filter to keep only near-vertical lines and draw them
-vertical_lines = []
-if lines is not None:
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
-        # Keep lines that are close to vertical (between 70-110 degrees)
-        if 70 < angle < 110:
-            vertical_lines.append(line[0])
-            cv2.line(lines_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-# =====================================================
-# DISPLAY RESULTS
-# =====================================================
-plt.figure(figsize=(18, 12))
-
-plt.subplot(2, 4, 1)
-plt.title('1. Original')
-show_image(image)
-plt.axis('off')
-
-plt.subplot(2, 4, 2)
-plt.title('2. Grayscale')
-show_image(gray)
-plt.axis('off')
-
-plt.subplot(2, 4, 3)
-plt.title('3. CLAHE Enhanced')
-show_image(enhanced)
-plt.axis('off')
-
-plt.subplot(2, 4, 4)
-plt.title('4. Dark Threshold (B&W)')
-show_image(dark_thresh)
-plt.axis('off')
-
-plt.subplot(2, 4, 5)
-plt.title('5. Vertical Mask')
-show_image(vertical_mask)
-plt.axis('off')
-
-plt.subplot(2, 4, 6)
-plt.title('6. Column Edges')
-show_image(column_edges)
-plt.axis('off')
-
-plt.subplot(2, 4, 7)
-plt.title(f'7. Hough Lines ({len(vertical_lines)} found)')
-show_image(lines_image)
-plt.axis('off')
-
-# Show the columns overlaid on original
-overlay = image.copy()
-overlay[vertical_mask > 0] = [0, 255, 0]  # green overlay on columns
-blended = cv2.addWeighted(image, 0.7, overlay, 0.3, 0)
-plt.subplot(2, 4, 8)
-plt.title('8. Columns Overlay')
-show_image(blended)
-plt.axis('off')
-
-plt.tight_layout()
-plt.show()
-
-# Print summary
-print(f"\n=== Slalom Column Detection Summary ===")
-print(f"Vertical lines detected: {len(vertical_lines)}")
-for i, (x1, y1, x2, y2) in enumerate(vertical_lines):
-    angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
-    print(f"  Line {i+1}: ({x1},{y1}) -> ({x2},{y2}), angle={angle:.1f}°")
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "image (2).png"
+    run(target)
