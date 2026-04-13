@@ -208,33 +208,87 @@ def find_poles(image,
 # ---------------------------------------------------------------------------
 
 def detect_gate_poles(image):
-    inter, spans, full_mask = find_poles(
-        image,
-        sobel_thresh=15,
-        continuity_px=60,
-        min_lower_rows=60,
-        min_pole_width=3,
-        max_pole_width=14,
-        lower_frac=0.25,
-        border_frac=0.12,          # gate image has a large fisheye border
-    )
+    """
+    Gate-specific detector using column brightness dips.
+
+    The inner gate posts appear DARK against the bright pool floor.
+    Averaging brightness over the lower half of the frame and finding
+    local minima in the column profile reliably locates both posts.
+    The Sobel edge approach fails here because the post edges are too
+    similar in strength to the surrounding lane-line noise.
+    """
     h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    if len(spans) < 2:
-        print(f"  [gate] Only {len(spans)} pole(s) — using all")
-        return inter, spans, full_mask
+    # Build intermediates for the display panel
+    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    blurred  = cv2.GaussianBlur(enhanced, (3, 3), 0.8)
+    sobelx   = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
 
-    spans_sorted = sorted(spans, key=lambda s: (s[0] + s[1]) // 2)
-    selected = [spans_sorted[0], spans_sorted[-1]]
+    def to_binary(arr, t):
+        mx = arr.max()
+        if mx < 1e-6:
+            return np.zeros(arr.shape, dtype=np.uint8)
+        normed = (arr / mx * 255).astype(np.uint8)
+        _, binary = cv2.threshold(normed, t, 255, cv2.THRESH_BINARY)
+        return binary
 
+    inter = {
+        "enhanced":      enhanced,
+        "left_cont":     to_binary(np.clip( sobelx, 0, None), 12),
+        "right_cont":    to_binary(np.clip(-sobelx, 0, None), 12),
+        "edge_combined": to_binary(np.abs(sobelx), 12),
+    }
+
+    # ------------------------------------------------------------------
+    # Column brightness-dip approach
+    # Average grayscale over y=50-90% of frame (below crossbar, above floor).
+    # Inner posts are darker than the bright pool floor → local minima.
+    # ------------------------------------------------------------------
+    y1, y2     = int(h * 0.50), int(h * 0.90)
+    col_mean   = gray[y1:y2, :].astype(float).mean(axis=0)
+    col_smooth = np.convolve(col_mean, np.ones(7) / 7, mode='same')
+
+    # Search only in the inner gate region (x: 40-68% of frame width)
+    x_lo, x_hi = int(w * 0.40), int(w * 0.68)
+
+    dips = []
+    for x in range(x_lo + 20, x_hi - 20):
+        if col_smooth[x] == col_smooth[x - 20: x + 20].min():
+            dips.append((float(col_smooth[x]), x))
+
+    dips.sort()   # darkest first
+    print(f"  [gate] Brightness dips in x={x_lo}→{x_hi}:")
+    for bri, x in dips[:6]:
+        print(f"         x={x}  brightness={bri:.1f}")
+
+    if len(dips) < 2:
+        print("  [gate] Not enough dips — falling back to edge method")
+        _, spans, mask = find_poles(image, sobel_thresh=12, continuity_px=50,
+                                    min_lower_rows=40, border_frac=0.30)
+        return inter, spans, mask
+
+    # Two darkest dips = left and right inner posts
+    selected_x = sorted([dips[0][1], dips[1][1]])
+    print(f"  [gate] Inner posts at x={selected_x[0]} (LEFT) and x={selected_x[1]} (RIGHT)")
+
+    # Draw boxes from crossbar level down to pool floor
+    crossbar_y = int(h * 0.50)
+    pole_bot   = int(h * 0.96)
+    half_w     = 12
+
+    spans     = []
     gate_mask = np.zeros((h, w), dtype=np.uint8)
-    for xl, xr, yt, yb in selected:
-        cx   = (xl + xr) // 2
+    for cx in selected_x:
+        xl   = max(0, cx - half_w)
+        xr   = min(w - 1, cx + half_w)
         side = "LEFT" if cx < w // 2 else "RIGHT"
-        print(f"  [gate] {side} pole: cx={cx}, y={yt}→{yb}")
-        cv2.rectangle(gate_mask, (xl, yt), (xr, yb), 255, -1)
+        print(f"  [gate] {side} pole: cx={cx}, y={crossbar_y}→{pole_bot}")
+        spans.append((xl, xr, crossbar_y, pole_bot))
+        cv2.rectangle(gate_mask, (xl, crossbar_y), (xr, pole_bot), 255, -1)
 
-    return inter, selected, gate_mask
+    return inter, spans, gate_mask
 
 
 # ---------------------------------------------------------------------------
