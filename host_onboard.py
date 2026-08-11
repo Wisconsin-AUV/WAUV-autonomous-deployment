@@ -1,5 +1,6 @@
 # pip install google-api-python-client google-auth
 
+import csv
 import json
 import time
 from datetime import datetime
@@ -14,6 +15,11 @@ SPREADSHEET_ID = "1AGvFOBRIquTPXWTbrjvzD-OaxFUDFkozYTc9cu27Jbg"
 TAB = "Form Responses 1"
 LAST_COL = "G"
 STATUS_COL = "H"
+
+SHARED_DRIVE_ID = "0APK2NlDvWvg3Uk9PVA"
+
+MECH_CSV = Path("mechanical_emails.csv")
+
 POLL_SECONDS = 30
 
 STATE_FILE = Path("state.json")
@@ -22,10 +28,25 @@ OUT_DIR = Path("entries")
 FIELDS = ["timestamp", "name", "major", "subteam",
           "why_interested", "project_interests", "email"]
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
 creds = service_account.Credentials.from_service_account_file(KEY_PATH, scopes=SCOPES)
+
+# build the clients for the APIs
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
+drive = build("drive", "v3", credentials=creds)
+
+def save_email(email: str):
+    """Append a Mechanical member's email to the CSV."""
+    new = not MECH_CSV.exists()
+    with MECH_CSV.open("a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["email"])
+        w.writerow([email])
 
 def read_cursor():
     """Last handled row. 1 = header only, so start at row 2."""
@@ -40,14 +61,46 @@ def write_cursor(row: int):
 def handle(entry: dict, row: int):
     """Process each entry."""
     print(f"[row {row}] {entry['name']} <{entry['email']}> -> {entry['subteam']}")
+
+    try:
+        # Add every member to the Google Drive
+        drive.permissions().create(
+            fileId=SHARED_DRIVE_ID,
+            body={
+                "type": "user",
+                "role": "writer",
+                "emailAddress": entry["email"],
+            },
+            sendNotificationEmail=True,
+            supportsAllDrives=True,
+        ).execute()
+
+        subteams = [team.strip() for team in entry["subteam"].split(",")]
+
+        if "Mechanical" in subteams:
+            # Save email to CSV because OnShape requires admin action to add
+            save_email(entry["email"])
+
+        if "Electrical" in subteams:
+            print("EEE")
+
+        if "Software" in subteams:
+            print("SWE")
+
+        if "Business" in subteams:
+            print("Boo")
+
+    except Exception as e:
+        print("When adding ", entry['name'], " : ", e)
+
     OUT_DIR.mkdir(exist_ok=True)
     (OUT_DIR / f"{row:04d}.json").write_text(json.dumps(entry, indent=2))
 
 def poll(cursor: int):
     """Handle everything below the cursor, mark it, then return the new cursor."""
     rows = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{TAB}'!A{cursor + 1}:{LAST_COL}",
+    spreadsheetId=SPREADSHEET_ID,
+    range=f"'{TAB}'!A{cursor + 1}:{LAST_COL}",
     ).execute().get("values", [])
 
     if not rows:
