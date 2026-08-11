@@ -1,10 +1,11 @@
 # pip install google-api-python-client google-auth
-
 import csv
 import json
 import time
 from datetime import datetime
 from pathlib import Path
+import os
+import requests
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -15,10 +16,12 @@ SPREADSHEET_ID = "1AGvFOBRIquTPXWTbrjvzD-OaxFUDFkozYTc9cu27Jbg"
 TAB = "Form Responses 1"
 LAST_COL = "G"
 STATUS_COL = "H"
-
 SHARED_DRIVE_ID = "0APK2NlDvWvg3Uk9PVA"
 
 MECH_CSV = Path("mechanical_emails.csv")
+
+GITHUB_ORG = "Wisconsin-AUV"
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 
 POLL_SECONDS = 30
 
@@ -38,6 +41,25 @@ creds = service_account.Credentials.from_service_account_file(KEY_PATH, scopes=S
 # build the clients for the APIs
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 drive = build("drive", "v3", credentials=creds)
+
+def add_to_github_org(email: str, role: str = "direct_member"):
+    """Invite one person to the GitHub org by email"""
+    resp = requests.post(
+        f"https://api.github.com/orgs/{GITHUB_ORG}/invitations",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        json={"email": email, "role": role},
+    )
+    if resp.status_code == 201:
+        print(f"Invited to GitHub: {email}")
+    elif resp.status_code == 422:
+        print(f"GitHub skip ({email}): {resp.json().get('message', resp.text[:200])}")
+    else:
+        print(f"GitHub invite FAILED ({resp.status_code}): {resp.text[:200]}")
+    return resp
 
 def save_email(email: str):
     """Append a Mechanical member's email to the CSV."""
@@ -85,7 +107,7 @@ def handle(entry: dict, row: int):
             print("EEE")
 
         if "Software" in subteams:
-            print("SWE")
+            add_to_github_org(entry["email"])
 
         if "Business" in subteams:
             print("Boo")
