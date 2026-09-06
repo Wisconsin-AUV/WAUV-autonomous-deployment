@@ -1,31 +1,9 @@
-# WauvSoftware
+Games to use with depth camera (just for fun)
 
-please add these to your .gitignore: 
-
-
-# ROS2 build directories
-build/*
-install/*
-log/*
-
-# Python cache
-_pycache_/*
-*.pyc
-*.pyo
-*.pyd
-
-# Colcon
-.colcon/*
-
-# Editor / IDE
-.vscode/*
-.idea/*
-*.swp
-*~
-
-# Python venvs
-*env*/*
-.env/*
-
-# ROS2 launch logs
-*.launch.pyc
+Setup:
+- Clone this repo on the Jetson and whichever computer you want to physically use for display and control
+- Setup the environments as dictated in the SoF of either script
+- Connect Jetson and laptop via included USB cable
+- Run hips_dont_lie.py on the Jetson and controller.py on the laptop
+- Open Subway Surfers on poki.com
+- Have fun!
