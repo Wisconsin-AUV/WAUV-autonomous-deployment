@@ -1,4 +1,4 @@
-# pip install google-api-python-client google-auth
+# pip install google-api-python-client google-auth requests python-dotenv
 import csv
 import json
 import time
@@ -6,17 +6,22 @@ from datetime import datetime
 from pathlib import Path
 import os
 import requests
+from dotenv import load_dotenv
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+# Load secrets from .env (never commit this file)
+load_dotenv()
+
 ### CONFIG
-KEY_PATH = "wauv-503115-9857946f1c1e.json"
+KEY_PATH = "wauv-503115-7449399e56c3.json"
 SPREADSHEET_ID = "1AGvFOBRIquTPXWTbrjvzD-OaxFUDFkozYTc9cu27Jbg"
 TAB = "Form Responses 1"
 LAST_COL = "G"
 STATUS_COL = "H"
 SHARED_DRIVE_ID = "0APK2NlDvWvg3Uk9PVA"
+TEAM_CALENDAR_ID = "0cafdbcb5af750c64957bc0f2b8d5307290e2a6a13fbbc89baa40873d199bbf9@group.calendar.google.com"
 
 MECH_CSV = Path("mechanical_emails.csv")
 
@@ -33,7 +38,8 @@ FIELDS = ["timestamp", "name", "major", "subteam",
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/calendar"
 ]
 
 creds = service_account.Credentials.from_service_account_file(KEY_PATH, scopes=SCOPES)
@@ -41,6 +47,7 @@ creds = service_account.Credentials.from_service_account_file(KEY_PATH, scopes=S
 # build the clients for the APIs
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 drive = build("drive", "v3", credentials=creds)
+calendar = build("calendar", "v3", credentials=creds)
 
 def add_to_github_org(email: str, role: str = "direct_member"):
     """Invite one person to the GitHub org by email"""
@@ -60,6 +67,14 @@ def add_to_github_org(email: str, role: str = "direct_member"):
     else:
         print(f"GitHub invite FAILED ({resp.status_code}): {resp.text[:200]}")
     return resp
+
+def add_to_calendar(email: str, role: str = "reader"):
+    """Share the team calendar with one person (they get an email to add it)."""
+    calendar.acl().insert(
+        calendarId=TEAM_CALENDAR_ID,
+        body={"role": role, "scope": {"type": "user", "value": email}},
+        sendNotifications=True,
+    ).execute()
 
 def save_email(email: str):
     """Append a Mechanical member's email to the CSV."""
@@ -96,6 +111,9 @@ def handle(entry: dict, row: int):
             sendNotificationEmail=True,
             supportsAllDrives=True,
         ).execute()
+
+        # Add every member to the team calendar
+        add_to_calendar(entry["email"])
 
         subteams = [team.strip() for team in entry["subteam"].split(",")]
 
