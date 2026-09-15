@@ -28,7 +28,7 @@ MECH_CSV = Path("mechanical_emails.csv")
 GITHUB_ORG = "Wisconsin-AUV"
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 
-POLL_SECONDS = 30
+POLL_SECONDS = 5
 
 STATE_FILE = Path("state.json")
 OUT_DIR = Path("entries")
